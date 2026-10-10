@@ -1,0 +1,74 @@
+# HPH Digital AI – a LanceDB natív macOS (Apple Silicon) dinamikus könyvtárának építése a lancedb-go fő ágából.
+# Használat: ezt a fájlt a saját forkban a `.github/workflows/build-macos-dylib.yml` útvonalra kell tenni, majd Actions → „Build macOS arm64 dylib” → Run workflow.
+name: Build macOS arm64 dylib
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Az építendő ág, címke vagy commit (alapérték: main)"
+        required: false
+        default: "main"
+
+jobs:
+  build:
+    runs-on: macos-14          # Apple Silicon (arm64) futtató
+    timeout-minutes: 120
+    steps:
+      - name: Forráskód letöltése
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Rust-eszközlánc (csak a felhős építéshez, a Macre nem kerül)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Protobuf fordító
+        run: brew install protobuf
+
+      - name: Gyorsítótár
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "rust -> target"
+
+      - name: Dinamikus könyvtár építése
+        working-directory: rust
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "13.0"
+        run: |
+          # a fő ág csak statikus könyvtárat épít; a dlopen-hez dinamikus (cdylib) kell
+          sed -i '' 's/crate-type = \["staticlib"\]/crate-type = ["cdylib"]/' Cargo.toml
+          grep -n "crate-type" Cargo.toml
+          cargo build --release --target aarch64-apple-darwin
+
+      - name: Összegyűjtés, aláírás, ellenőrző összegek
+        run: |
+          mkdir -p out
+          cp rust/target/aarch64-apple-darwin/release/liblancedb_go.dylib out/
+          H="$(find rust/target -name lancedb.h | head -1)"
+          if [ -n "$H" ]; then cp "$H" out/lancedb.h; fi
+          cd out
+          install_name_tool -id @rpath/liblancedb_go.dylib liblancedb_go.dylib
+          codesign --force --sign - liblancedb_go.dylib
+          shasum -a 256 liblancedb_go.dylib > SHA256SUMS.txt
+          nm -gU liblancedb_go.dylib | awk '{print $3}' | sed 's/^_//' | grep '^simple_lancedb' | sort > symbols.txt
+          echo "Exportált simple_lancedb függvények: $(wc -l < symbols.txt)"
+          for f in create_index_v2 table_optimize list_versions table_merge_insert; do
+            if grep -q "$f" symbols.txt; then echo "OK   $f"; else echo "HIÁNYZIK $f"; fi
+          done
+          {
+            echo "forrás: $GITHUB_REPOSITORY @ $(git -C .. rev-parse HEAD)"
+            date -u
+            rustc --version
+            file liblancedb_go.dylib
+          } > build-info.txt
+          cat build-info.txt
+
+      - name: Eredmény feltöltése
+        uses: actions/upload-artifact@v4
+        with:
+          name: lancedb-macos-arm64
+          path: out/*
+          retention-days: 30
